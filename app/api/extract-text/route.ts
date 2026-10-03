@@ -1,47 +1,40 @@
 import { NextRequest, NextResponse } from 'next/server';
 import mammoth from 'mammoth';
 import path from 'path';
+import { pathToFileURL } from 'url';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
+// Cache the worker so we only load it once per server lifecycle
+let workerInitialized = false;
+
+async function initPdfWorker() {
+  if (workerInitialized) return;
+  // Load the pdfjs-dist legacy worker and inject it into globalThis.
+  // pdf-parse v2 checks globalThis.pdfjsWorker?.WorkerMessageHandler before
+  // attempting to spawn a worker thread, so this bypasses the file:// URL issue.
+  const workerPath = path.join(process.cwd(), 'node_modules', 'pdfjs-dist', 'legacy', 'build', 'pdf.worker.mjs');
+  const workerUrl = pathToFileURL(workerPath).href;
+  const worker = await import(/* webpackIgnore: true */ workerUrl);
+  (globalThis as any).pdfjsWorker = { WorkerMessageHandler: worker.WorkerMessageHandler };
+  workerInitialized = true;
+}
+
 async function extractPdfText(buffer: Buffer): Promise<string> {
-  // Use pdfjs-dist legacy build directly — installed as a dependency of pdf-parse
-  // The legacy build is the correct one for Node.js server environments
-  const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs' as any);
+  await initPdfWorker();
 
-  // Point worker to the bundled worker file using an absolute file:// URL
-  const workerPath = path.join(
-    process.cwd(),
-    'node_modules',
-    'pdfjs-dist',
-    'legacy',
-    'build',
-    'pdf.worker.mjs'
-  );
-  pdfjsLib.GlobalWorkerOptions.workerSrc = `file:///${workerPath.replace(/\\/g, '/')}`;
+  const { PDFParse, VerbosityLevel } = require('pdf-parse');
+  const parser = new PDFParse({ data: buffer, verbosity: VerbosityLevel.ERRORS });
 
-  const loadingTask = pdfjsLib.getDocument({
-    data: new Uint8Array(buffer),
-    useWorkerFetch: false,
-    isEvalSupported: false,
-    useSystemFonts: true,
-  });
-
-  const pdf = await loadingTask.promise;
-  let text = '';
-
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const pageText = (content.items as any[])
-      .map((item: any) => item.str)
-      .join(' ');
-    text += pageText + '\n';
-    page.cleanup();
+  try {
+    const result = await parser.getText();
+    return result?.text || '';
+  } finally {
+    if (typeof parser.destroy === 'function') {
+      await parser.destroy();
+    }
   }
-
-  return text;
 }
 
 export async function POST(req: NextRequest) {
