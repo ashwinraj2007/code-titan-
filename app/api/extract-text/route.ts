@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import mammoth from 'mammoth';
 
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
@@ -27,18 +30,31 @@ export async function POST(req: NextRequest) {
     } else if (lowerName.endsWith('.pdf')) {
       // Extract from Adobe PDF
       try {
-        // dynamic require for pdf-parse to avoid bundling issues
-        const pdfParse = require('pdf-parse');
-        const pdfData = await pdfParse(buffer);
-        extractedText = pdfData.text || '';
+        // dynamic require to support both pdf-parse v2 (class) and v1 (function)
+        const pdfModule = require('pdf-parse');
+        const PDFClass = pdfModule.PDFParse || (pdfModule.default && pdfModule.default.PDFParse);
+
+        if (typeof PDFClass === 'function') {
+          // pdf-parse v2+ API
+          const parser = new PDFClass({ data: buffer });
+          try {
+            const pdfData = await parser.getText();
+            extractedText = pdfData?.text || '';
+          } finally {
+            if (typeof parser.destroy === 'function') {
+              await parser.destroy();
+            }
+          }
+        } else if (typeof pdfModule === 'function') {
+          // pdf-parse v1 API
+          const pdfData = await pdfModule(buffer);
+          extractedText = pdfData?.text || '';
+        } else if (typeof pdfModule.default === 'function') {
+          const pdfData = await pdfModule.default(buffer);
+          extractedText = pdfData?.text || '';
+        }
       } catch (pdfErr: any) {
-        console.warn('PDF parse fallback:', pdfErr);
-        // Fallback: extract printable strings from PDF stream
-        const rawString = buffer.toString('latin1');
-        const textMatches = rawString.match(/\(([^()]+)\)T[jd]/g) || [];
-        extractedText = textMatches
-          .map(m => m.replace(/^[(]/, '').replace(/[)]T[jd]$/, ''))
-          .join(' ');
+        console.warn('PDF parse failed:', pdfErr);
       }
     } else {
       // Plain text, Markdown, RTF, CSV, HTML
