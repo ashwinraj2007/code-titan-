@@ -1,8 +1,48 @@
 import { NextRequest, NextResponse } from 'next/server';
 import mammoth from 'mammoth';
+import path from 'path';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
+
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  // Use pdfjs-dist legacy build directly — installed as a dependency of pdf-parse
+  // The legacy build is the correct one for Node.js server environments
+  const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs' as any);
+
+  // Point worker to the bundled worker file using an absolute file:// URL
+  const workerPath = path.join(
+    process.cwd(),
+    'node_modules',
+    'pdfjs-dist',
+    'legacy',
+    'build',
+    'pdf.worker.mjs'
+  );
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `file:///${workerPath.replace(/\\/g, '/')}`;
+
+  const loadingTask = pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+  });
+
+  const pdf = await loadingTask.promise;
+  let text = '';
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = (content.items as any[])
+      .map((item: any) => item.str)
+      .join(' ');
+    text += pageText + '\n';
+    page.cleanup();
+  }
+
+  return text;
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -28,33 +68,11 @@ export async function POST(req: NextRequest) {
       const result = await mammoth.extractRawText({ buffer });
       extractedText = result.value || '';
     } else if (lowerName.endsWith('.pdf')) {
-      // Extract from Adobe PDF
+      // Extract from Adobe PDF using pdfjs-dist legacy build
       try {
-        // dynamic require to support both pdf-parse v2 (class) and v1 (function)
-        const pdfModule = require('pdf-parse');
-        const PDFClass = pdfModule.PDFParse || (pdfModule.default && pdfModule.default.PDFParse);
-
-        if (typeof PDFClass === 'function') {
-          // pdf-parse v2+ API
-          const parser = new PDFClass({ data: buffer });
-          try {
-            const pdfData = await parser.getText();
-            extractedText = pdfData?.text || '';
-          } finally {
-            if (typeof parser.destroy === 'function') {
-              await parser.destroy();
-            }
-          }
-        } else if (typeof pdfModule === 'function') {
-          // pdf-parse v1 API
-          const pdfData = await pdfModule(buffer);
-          extractedText = pdfData?.text || '';
-        } else if (typeof pdfModule.default === 'function') {
-          const pdfData = await pdfModule.default(buffer);
-          extractedText = pdfData?.text || '';
-        }
+        extractedText = await extractPdfText(buffer);
       } catch (pdfErr: any) {
-        console.warn('PDF parse failed:', pdfErr);
+        console.warn('PDF extraction failed:', pdfErr?.message);
       }
     } else {
       // Plain text, Markdown, RTF, CSV, HTML
