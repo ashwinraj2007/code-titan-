@@ -1,41 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import mammoth from 'mammoth';
-import path from 'path';
-import { pathToFileURL } from 'url';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
-
-// Cache the worker so we only load it once per server lifecycle
-let workerInitialized = false;
-
-async function initPdfWorker() {
-  if (workerInitialized) return;
-  // Load the pdfjs-dist legacy worker and inject it into globalThis.
-  // pdf-parse v2 checks globalThis.pdfjsWorker?.WorkerMessageHandler before
-  // attempting to spawn a worker thread, so this bypasses the file:// URL issue.
-  const workerPath = path.join(process.cwd(), 'node_modules', 'pdfjs-dist', 'legacy', 'build', 'pdf.worker.mjs');
-  const workerUrl = pathToFileURL(workerPath).href;
-  const worker = await import(/* webpackIgnore: true */ workerUrl);
-  (globalThis as any).pdfjsWorker = { WorkerMessageHandler: worker.WorkerMessageHandler };
-  workerInitialized = true;
-}
-
-async function extractPdfText(buffer: Buffer): Promise<string> {
-  await initPdfWorker();
-
-  const { PDFParse, VerbosityLevel } = require('pdf-parse');
-  const parser = new PDFParse({ data: buffer, verbosity: VerbosityLevel.ERRORS });
-
-  try {
-    const result = await parser.getText();
-    return result?.text || '';
-  } finally {
-    if (typeof parser.destroy === 'function') {
-      await parser.destroy();
-    }
-  }
-}
 
 export async function POST(req: NextRequest) {
   try {
@@ -60,21 +27,24 @@ export async function POST(req: NextRequest) {
       // Extract from Microsoft Word (.docx)
       const result = await mammoth.extractRawText({ buffer });
       extractedText = result.value || '';
+
     } else if (lowerName.endsWith('.pdf')) {
-      // Extract from Adobe PDF using pdfjs-dist legacy build
+      // Extract from PDF using pdf-parse v1 (simple function, no workers needed)
       try {
-        extractedText = await extractPdfText(buffer);
+        const pdfParse = require('pdf-parse');
+        const data = await pdfParse(buffer);
+        extractedText = data.text || '';
       } catch (pdfErr: any) {
-        console.warn('PDF extraction failed:', pdfErr?.message);
+        console.warn('PDF parse error:', pdfErr?.message);
       }
+
     } else {
       // Plain text, Markdown, RTF, CSV, HTML
       extractedText = buffer.toString('utf-8');
-      // Strip HTML tags if any
       extractedText = extractedText.replace(/<[^>]*>?/gm, ' ');
     }
 
-    // Clean whitespace and remove control chars
+    // Clean whitespace and remove control characters
     const cleaned = extractedText
       .replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, '')
       .replace(/\r\n/g, '\n')
@@ -97,6 +67,7 @@ export async function POST(req: NextRequest) {
       wordCount: words,
       characterCount: cleaned.length,
     });
+
   } catch (error: any) {
     console.error('Error in /api/extract-text:', error);
     return NextResponse.json(
@@ -105,3 +76,4 @@ export async function POST(req: NextRequest) {
     );
   }
 }
+
